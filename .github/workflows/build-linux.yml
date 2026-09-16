@@ -1,0 +1,209 @@
+name: Build & Release Linux Binary
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream Sing-Box ref (branch/tag/sha), e.g. main"
+        required: true
+        type: string
+        default: "main"
+
+      version:
+        description: "Release version string (no leading v), e.g. 1.14.0"
+        required: true
+        type: string
+
+      go_version:
+        description: "Go version for actions/setup-go, e.g. 1.23.1"
+        required: true
+        type: string
+        default: "1.23.1"
+
+      build_tags:
+        description: "Sing-Box build tags (comma-separated, no spaces), e.g. with_quic,with_dhcp"
+        required: true
+        type: string
+        default: "with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,badlinkname,tfogo_checklinkname0,with_naive_outbound,with_grpc"
+
+      pre_release:
+        description: "Mark GitHub Release as pre-release"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+
+    steps:
+      - name: Checkout sing-box source
+        uses: actions/checkout@v5
+        with:
+          repository: SagerNet/sing-box
+          ref: ${{ inputs.upstream_ref }}
+          path: sing-box
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ inputs.go_version }}
+          cache: false
+          cache-dependency-path: sing-box/go.sum
+
+      - name: Clone cronet-go (required for with_naive_outbound)
+        working-directory: sing-box
+        shell: bash
+        run: |
+          set -xeuo pipefail
+
+          CRONET_GO_VERSION="$(cat .github/CRONET_GO_VERSION)"
+          rm -rf "$HOME/cronet-go"
+          git init "$HOME/cronet-go"
+          git -C "$HOME/cronet-go" remote add origin https://github.com/sagernet/cronet-go.git
+          git -C "$HOME/cronet-go" sparse-checkout set --no-cone '/*' '!/lib'
+          git -C "$HOME/cronet-go" fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
+          git -C "$HOME/cronet-go" checkout FETCH_HEAD
+          git -C "$HOME/cronet-go" submodule update --init --recursive --depth=1
+
+      - name: Regenerate Debian keyring
+        shell: bash
+        run: |
+          set -xeuo pipefail
+
+          rm -f "$HOME/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg"
+          cd "$HOME/cronet-go"
+          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
+
+      - name: Download Chromium toolchain (${{ matrix.goarch }})
+        shell: bash
+        run: |
+          set -xeuo pipefail
+
+          cd "$HOME/cronet-go"
+          go run ./cmd/build-naive \
+            --target=linux/${{ matrix.goarch }} \
+            download-toolchain
+
+      - name: Save Chromium toolchain environment
+        shell: bash
+        run: |
+          set -xeuo pipefail
+
+          cd "$HOME/cronet-go"
+          go run ./cmd/build-naive \
+            --target=linux/${{ matrix.goarch }} \
+            env > "$RUNNER_TEMP/cronet.env"
+
+          cat "$RUNNER_TEMP/cronet.env"
+
+      - name: Read official linker flags (required for badlinkname)
+        working-directory: sing-box
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "$GITHUB_ENV"
+
+      - name: Build Linux binary (${{ matrix.goarch }})
+        working-directory: sing-box
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -xeuo pipefail
+
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            key="${line%%=*}"
+            value="${line#*=}"
+            export "${key}=${value}"
+          done < "$RUNNER_TEMP/cronet.env"
+
+          mkdir -p dist
+
+          go build -v -trimpath \
+            -o dist/sing-box \
+            -tags "${{ inputs.build_tags }}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ inputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+
+          file dist/sing-box
+
+      - name: Package tar.gz
+        working-directory: sing-box
+        shell: bash
+        run: |
+          set -xeuo pipefail
+
+          VERSION="${{ inputs.version }}"
+          ARCH="${{ matrix.goarch }}"
+          DIR_NAME="sing-box-${VERSION}-linux-${ARCH}"
+
+          mkdir -p "../release/${DIR_NAME}"
+          cp LICENSE "../release/${DIR_NAME}/LICENSE"
+          cp dist/sing-box "../release/${DIR_NAME}/sing-box"
+
+          pushd ../release >/dev/null
+          tar -czf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
+          rm -rf "${DIR_NAME}"
+          popd >/dev/null
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.goarch }}
+          path: release/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_TAG="v${{ inputs.version }}"
+          PRERELEASE_FLAG=""
+          if [[ "${{ inputs.pre_release }}" == "true" ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          NOTES="Upstream ref: ${{ inputs.upstream_ref }}
+          Go version: ${{ inputs.go_version }}
+          Build tags: ${{ inputs.build_tags }}"
+
+          if gh release view -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" release/*.tar.gz --clobber
+          else
+            gh release create -R "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
+              --notes "${NOTES}" \
+              ${PRERELEASE_FLAG} \
+              release/*.tar.gz
+          fi
